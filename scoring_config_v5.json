@@ -1,0 +1,42 @@
+{
+  "_comment": "v5 — whole numbers only, no appearance points, penalties worth the same as an open-play goal inside the box. Only clean sheets and goals conceded vary by position. Goalkeeping actions are position-specific by nature. EXCLUDED, feed incomplete in 2025/26: offsides, dispossessed, saves inside box. EXCLUDED, not collected by any free source: big chances created, errors leading to a chance or goal, penalties won, successful corners, passes into the box, passes received in the box.",
+  "scale": 1.0,
+  "stats": {
+    "played": 0,
+    "played_60": 0,
+    "minutes_10": 0,
+
+    "goal_inside_box": 80,
+    "goal_penalty": 80,
+    "goal_outside_box": 100,
+    "assist": 50,
+    "chance_created": 10,
+    "shot_on_target": 4,
+    "hit_woodwork": 5,
+    "touch_opp_box": 2,
+    "successful_dribble": 4,
+    "accurate_cross": 3,
+    "was_fouled": 3,
+    "final_third_pass": 0,
+
+    "clean_sheet":   {"GK": 45, "DEF": 45, "MID": 15, "FWD": 0},
+    "goal_conceded": {"GK": -6, "DEF": -6, "MID": 0,  "FWD": 0},
+    "defcon_cbit": 3,
+    "recovery": 2,
+    "aerial_won": 4,
+    "ground_duel_won": 0,
+
+    "save": 8,
+    "goals_prevented": 20,
+    "sweeper_action": 3,
+    "high_claim": 3,
+    "penalty_saved": 60,
+
+    "dribbled_past": -2,
+    "foul_committed": -2,
+    "yellow": -8,
+    "red": -30,
+    "own_goal": -25,
+    "penalty_missed": -20
+  }
+}
