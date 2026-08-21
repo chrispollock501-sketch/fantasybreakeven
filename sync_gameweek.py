@@ -22,6 +22,13 @@ WHERE THE DATA COMES FROM (v2 — rewritten 2026-08-20)
               the FPL-official per-gameweek fields the match feed doesn't carry:
               yellow cards, red cards, own goals, penalties saved, clean sheets,
               goals conceded. Discrete per gameweek, not cumulative.
+        - data/{season}/By Tournament/Premier League/GW{n}/shots.csv
+              one row per shot, keyed on the same FPL player_id as the match feed,
+              carrying start_x / start_y pitch coordinates, `outcome` and `situation`.
+              This is what splits goals into inside-the-box (80) and outside-the-box
+              (100) and what supplies hit_woodwork (outcome == 'post'). It sits in the
+              same gameweek folder as playermatchstats.csv, so it costs one extra
+              fetch per gameweek and adds no new source, no scraper and no schedule.
         - data/{season}/players.csv   player_id -> player_code (the permanent FPL
               code this game uses as its player_id) and position.
 
@@ -30,10 +37,6 @@ WHERE THE DATA COMES FROM (v2 — rewritten 2026-08-20)
         are mapped onto those ids by (gameweek, home team, away team) — both mirrors
         use identical FPL team ids.
 
-    Optional overlay: understat_goals_{season}.json, if present in ROOT (see
-        fetch_understat_shots.py). Splits goals into inside-the-box / outside-the-box
-        / penalty. Without it every goal scores at the inside-the-box rate.
-
 WHAT THIS FIXES
     The previous version read only the vaastav mirror, which carries the official FPL
     fields and nothing else. Measured across all 11,492 player-appearances of the
@@ -41,15 +44,25 @@ WHAT THIS FIXES
     defines — and unevenly: GK 86.9%, DEF 80.9%, MID 66.0%, FWD 60.8%. Since starting
     prices were modelled on the full stat set, every breakeven was unreachable and the
     shortfall was position-biased, which would have repriced the whole market toward
-    defenders. This version scores every line in the config except the inside/outside
-    box goal split and hit-woodwork.
+    defenders. This version feeds every line in the config real data.
 
-STILL NOT SCORED, and why
-    - goal_outside_box (100 vs 80) — needs shot coordinates. Supply
-      understat_goals_{season}.json to close it; otherwise all goals score 80.
-    - hit_woodwork (5) — Core-Insights carries it at team level only, no free
-      per-player source. 0.2% of points.
-    Everything else in scoring_config_v5.json is now fed real data.
+WHAT SHOTS.CSV CLOSED (2026-08-21)
+    Every non-zero line in scoring_config_v5.json now has a source. The last two gaps
+    were goal_outside_box (100 vs 80, 2.2% of points) and hit_woodwork (5, 0.2%), and
+    both were closed by a file that had been sitting unused in the same Core-Insights
+    gameweek folders all along. An earlier attempt to close the first one by scraping
+    Understat is gone: it needed a second data source, a second scheduled job, a
+    page-format-dependent regex and fuzzy player-name matching, and none of those are
+    necessary when the shot rows are already keyed on FPL player ids.
+
+    One honest caveat: hit_woodwork is credited at about 73% of the truth. 211 shots
+    carry outcome == 'post' in 2025/26 against 288 the same feed reports at team
+    level, and nothing per-shot separates the other 77 from an ordinary near-miss.
+    --audit prints both numbers every run. See reconcile_woodwork().
+
+    Still genuinely unavailable free, and still zeroed in the config: big chances
+    created, errors leading to a chance or goal, penalties won, successful corners,
+    passes into the box, passes received in the box.
 
 USAGE
     python3 sync_gameweek.py                 # every gameweek with published match stats
@@ -80,6 +93,7 @@ USAGE
 import csv
 import io
 import json
+import math
 import os
 import sys
 import urllib.error
@@ -272,16 +286,200 @@ FPL_KEYS = {
 
 
 def fetch_gw(ci_season, gw):
-    """Return (playermatchstats rows, player_gameweek_stats rows) or (None, None)."""
+    """Return (playermatchstats rows, player_gameweek_stats rows, shots rows, status).
+
+    `status` is 'ok', 'absent' (a real 404 — the feed hasn't published shots for this
+    gameweek) or 'error' (a timeout, a 503, anything else). The distinction matters:
+    a 404 during a gameweek still being played is normal, while an error means the
+    file may well exist and be perfectly good. Collapsing the two is how a transient
+    blip would silently rewrite a correctly-scored gameweek with every goal at 80.
+    """
     pms = fetch_csv_or_none(
         ci_url(ci_season, 'By Tournament', 'Premier League', f'GW{gw}', 'playermatchstats.csv'))
     pgs = fetch_csv_or_none(
         ci_url(ci_season, 'By Gameweek', f'GW{gw}', 'player_gameweek_stats.csv'))
-    return pms, pgs
+    try:
+        shots = fetch_csv_or_none(
+            ci_url(ci_season, 'By Tournament', 'Premier League', f'GW{gw}', 'shots.csv'),
+            only_404=True)
+        status = 'absent' if shots is None else 'ok'
+    except Exception as e:  # noqa: BLE001
+        print(f'  ! gw{gw}: shots.csv could not be fetched ({e})', file=sys.stderr)
+        shots, status = None, 'error'
+    return pms, pgs, shots, status
+
+
+# ------------------------------------------------------------------- shot location
+
+# Where the edge of the penalty area sits in Core-Insights' shot coordinates.
+#
+# start_y is unambiguously a 0-100 scale across the pitch width: all 92 penalties in
+# 2025/26 sit at exactly y = 50.0. start_x runs from the goal line being attacked and
+# is *close* to metres — penalties sit at x = 11.5 against a real penalty spot of
+# 10.97m — but not exactly, so the boundary is calibrated rather than assumed.
+#
+# The calibration is against the provider's own numbers. matches.csv publishes
+# home/away_shots_inside_box and _outside_box per match; classifying all 9,504 shots
+# of 2025/26 with the values below reproduces those counts exactly for 751 of 760
+# team-matches (98.8%), season totals 6,409 inside vs 6,402 reported. Sweeping the
+# threshold shows a clear plateau at 16.9-17.0 — 16.5 scores 92.5% and treating
+# start_x as a percentage of a 105m pitch (15.71) scores 73.4%, so this is well
+# identified, not a fudge. The y bounds are the true geometric ones (a 40.32m box on
+# a 68m pitch); agreement is flat across 20.3-22.0 because almost nothing is shot
+# from that sliver, so the honest geometric value is used.
+#
+# reconcile_shot_box() re-runs this check on EVERY sync, not only under --audit, and
+# a gameweek that falls below SHOT_BOX_MIN_AGREEMENT has its split discarded (every
+# goal reverts to 80) with a loud warning. Worst single gameweek in 2025/26 was 18/20
+# = 90%, so the floor is set well under that: a genuine rescale scores near zero.
+SHOT_BOX_MIN_AGREEMENT = 0.70
+SHOT_BOX_X = 16.95
+SHOT_BOX_Y_LO = (68 - 40.32) / 2 / 68 * 100      # 20.35
+SHOT_BOX_Y_HI = 100 - SHOT_BOX_Y_LO              # 79.65
+
+
+def shot_inside_box(row):
+    """True if the shot was taken inside the penalty area. Missing, unparseable, NaN
+    or infinite coordinates return True — the inside rate (80) is both the common
+    case and the lower of the two, so an unknown never inflates a score.
+
+    NaN is checked explicitly and not left to the comparison: float('nan') parses
+    without raising, and every comparison against it is False, so `x <= SHOT_BOX_X`
+    would quietly classify it as OUTSIDE and pay 100. 'NaN' is exactly what a pandas
+    CSV writer emits for a null with a non-default na_rep, so this is a live risk,
+    not a theoretical one."""
+    try:
+        x = float(row['start_x'])
+        y = float(row['start_y'])
+    except (KeyError, TypeError, ValueError):
+        return True
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return True
+    return x <= SHOT_BOX_X and SHOT_BOX_Y_LO <= y <= SHOT_BOX_Y_HI
+
+
+def summarise_shots(shots, players, match_ids=None):
+    """shots.csv rows -> ({player_code: {'outside': n, 'post': n}}, unresolved_count).
+
+    Only the outside-the-box count is carried, not the inside one: playermatchstats
+    is authoritative for how many goals a player scored, so inside is derived as
+    (open-play goals - outside) in build_rows(). That way a shot row the feed is
+    missing costs 20 points, never a phantom goal.
+
+    `match_ids` restricts the shots considered to matches that playermatchstats has
+    also published. Without it the two feeds can disagree about WHICH match a goal
+    came from: if shots.csv carries an outside-the-box goal from a match whose player
+    stats aren't published yet, while pms carries an inside-the-box goal from a
+    different match in the same gameweek, the count-only clamp in build_rows() pays
+    the inside goal at 100. matches.csv publishes `stats_processed` and
+    `player_stats_processed` as separate flags — 20 matches in 2025/26 have them
+    disagreeing — so the two feeds demonstrably do move independently.
+
+    Penalties are excluded — scoring_config_v5.json prices a penalty at the
+    inside-the-box rate and build_rows() counts them separately. Own goals are
+    neither 'goal' nor 'post' here, so they neither create a goal nor credit
+    woodwork; they are credited to the attacking player by the feed, and the
+    scoring config handles own goals from the FPL feed instead.
+    """
+    extra = {}
+    unresolved = 0
+    for r in shots or []:
+        if match_ids is not None and r.get('match_id') not in match_ids:
+            continue
+        meta = players.get(r.get('player_id'))
+        if meta is None:
+            unresolved += 1
+            continue
+        code = meta['code']
+        e = extra.setdefault(code, {'outside': 0, 'post': 0})
+        outcome = (r.get('outcome') or '').strip()
+        if outcome == 'post':
+            e['post'] += 1
+        elif outcome == 'goal':
+            if (r.get('situation') or '').strip() == 'penalty':
+                continue
+            if not shot_inside_box(r):
+                e['outside'] += 1
+    return extra, unresolved
+
+
+def reconcile_shot_box(shots, matches, match_ids=None):
+    """Check shot_inside_box() against the provider's own published team totals.
+
+    matches.csv carries home/away_shots_inside_box and _outside_box per match, which
+    is independent ground truth for the classification. This is the only defence
+    against the provider silently rescaling start_x / start_y — a change there would
+    not error, it would just start splitting goals wrongly and quietly move 20 points
+    a goal around the price economy.
+
+    Own goals are deliberately INCLUDED. The feed attributes them to the attacking
+    player, counts them in that team's shots_on_target, and counts them in the team
+    box totals; excluding them here manufactures mismatches (2 of them in 2025/26).
+
+    Returns (exact, total, got_in, got_out, rep_in, rep_out, off_by).
+    """
+    counted = {}
+    for r in shots or []:
+        if match_ids is not None and r.get('match_id') not in match_ids:
+            continue
+        key = (r.get('match_id'), (r.get('is_home') or '').strip())
+        c = counted.setdefault(key, [0, 0])
+        c[0 if shot_inside_box(r) else 1] += 1
+
+    exact = total = got_in = got_out = rep_in = rep_out = off_by = 0
+    for m in matches or []:
+        if match_ids is not None and m.get('match_id') not in match_ids:
+            continue
+        for side, flag in (('home', 'True'), ('away', 'False')):
+            try:
+                ri = int(float(m[f'{side}_shots_inside_box']))
+                ro = int(float(m[f'{side}_shots_outside_box']))
+            except (KeyError, TypeError, ValueError):
+                continue
+            gi, go = counted.get((m.get('match_id'), flag), [0, 0])
+            total += 1
+            got_in += gi
+            got_out += go
+            rep_in += ri
+            rep_out += ro
+            if gi == ri and go == ro:
+                exact += 1
+            else:
+                off_by += abs(gi - ri) + abs(go - ro)
+    return exact, total, got_in, got_out, rep_in, rep_out, off_by
+
+
+def reconcile_woodwork(shots, matches, match_ids=None):
+    """Same idea for hit_woodwork: outcome == 'post' against home/away_hit_woodwork.
+
+    Returns (ours, reported). These do NOT agree. Across 2025/26 the feed reports 288
+    woodwork hits at team level while only 211 shots carry outcome == 'post' — the
+    other 77 are coded 'miss', and nothing in goal_mouth_location or goal_mouth_z
+    separates them from an ordinary near-miss (checked: no post-specific value
+    exists). So woodwork is credited at about 73% of the truth. That is deliberate
+    and documented rather than silently wrong: hit_woodwork is 0.2% of all points,
+    the shortfall is roughly position-neutral, and under-crediting 27% of it moves a
+    player by about 1 point a season. Scoring 73% of it is closer to the prices the
+    game was modelled on than scoring none of it, which is what happened before."""
+    ours = reported = 0
+    for r in shots or []:
+        if match_ids is not None and r.get('match_id') not in match_ids:
+            continue
+        if (r.get('outcome') or '').strip() == 'post':
+            ours += 1
+    for m in matches or []:
+        if match_ids is not None and m.get('match_id') not in match_ids:
+            continue
+        for side in ('home', 'away'):
+            try:
+                reported += int(float(m[f'{side}_hit_woodwork']))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return ours, reported
 
 
 def build_rows(gw, pms, pgs, players, team_by_id, team_by_code, fixture_index,
-               ci_matches, understat):
+               ci_matches, shot_extra):
     """Merge the match feed with the FPL per-gameweek feed into one row per player,
     in the raw column vocabulary scoring.py's derive() expects."""
     # Core match_id -> FPL fixture id.
@@ -348,22 +546,19 @@ def build_rows(gw, pms, pgs, players, team_by_id, team_by_code, fixture_index,
         row['penalties_missed_fpl'] = 0     # taken from the match feed instead
         row['starts'] = num(f.get('starts')) > 0 if f else row['minutes_played'] >= 60
 
-        # goal location: Understat overlay if we have it, otherwise every goal
-        # scores at the inside-the-box rate, which is what the config's
-        # goal_inside_box value is.
+        # Goal location and woodwork, from shots.csv. playermatchstats stays
+        # authoritative for the goal count; shots.csv only says how many of those
+        # goals were struck from outside the area. Clamping to open_play means a
+        # disagreement between the two feeds can never invent a goal — the worst it
+        # can do is score one at 80 instead of 100.
+        extra = (shot_extra or {}).get(code) or {}
         pens = row['penalties_scored']
         open_play = max(0, row['goals'] - pens)
-        split = (understat or {}).get(str(code), {}).get(str(gw))
-        if split:
-            inside = min(open_play, num(split.get('inside')))
-            outside = min(open_play - inside, num(split.get('outside')))
-            leftover = open_play - inside - outside
-            row['goal_inside_box'] = inside + leftover
-            row['goal_outside_box'] = outside
-        else:
-            row['goal_inside_box'] = open_play
-            row['goal_outside_box'] = 0
+        outside = min(open_play, max(0, num(extra.get('outside'))))
+        row['goal_inside_box'] = open_play - outside
+        row['goal_outside_box'] = outside
         row['goal_penalty'] = pens
+        row['hit_woodwork'] = max(0, num(extra.get('post')))
         out.append(row)
 
     return out, unmatched
@@ -494,8 +689,10 @@ def run_audit(ci_season, gws):
     early_zero = {a: True for a in AUDITED}
     late_alive = {a: False for a in AUDITED}
     n_gw = len([g for g in gws])
+    shots_by_gw = {}
     for idx, gw in enumerate(gws):
-        pms, _ = fetch_gw(ci_season, gw)
+        pms, _, shots, _status = fetch_gw(ci_season, gw)
+        shots_by_gw[gw] = shots
         if not pms:
             continue
         line = f'{gw:<4} {len(pms):>5}  '
@@ -531,6 +728,65 @@ def run_audit(ci_season, gws):
         print('   quietly reward second-half-of-the-season players only.\n')
     else:
         print('No stat is absent early and alive later. Feed looks safe to score on.\n')
+
+    audit_shot_coordinates(ci_season, gws, shots_by_gw)
+
+
+def audit_shot_coordinates(ci_season, gws, shots_by_gw):
+    """Season-wide version of the per-gameweek check main() already runs: does
+    shot_inside_box() reproduce the inside/outside-box counts the feed publishes at
+    team level, and does outcome == 'post' reproduce its woodwork counts?
+
+    On 2025/26 the box split agrees exactly for 751 of 760 team-matches. Anything
+    below about 95% means the coordinates have moved and SHOT_BOX_X needs
+    recalibrating — main() independently refuses to apply a split below
+    SHOT_BOX_MIN_AGREEMENT, so a rescale costs 20 points a goal, never 100 points on
+    a tap-in."""
+    print('Shot reconciliation against the feed\'s own team-level totals')
+    exact = total = got_in = got_out = rep_in = rep_out = off_by = 0
+    wood_ours = wood_rep = 0
+    gws_with_shots = 0
+    for gw in gws:
+        shots = shots_by_gw.get(gw)
+        matches = fetch_csv_or_none(
+            ci_url(ci_season, 'By Tournament', 'Premier League', f'GW{gw}', 'matches.csv'))
+        if not shots or not matches:
+            continue
+        gws_with_shots += 1
+        e, t, gi, go, ri, ro, off = reconcile_shot_box(shots, matches)
+        exact += e
+        total += t
+        got_in += gi
+        got_out += go
+        rep_in += ri
+        rep_out += ro
+        off_by += off
+        wo, wr = reconcile_woodwork(shots, matches)
+        wood_ours += wo
+        wood_rep += wr
+    if not total:
+        print('  no gameweek in this range has both shots.csv and matches.csv — '
+              'nothing to reconcile. Goals all score at the inside-box rate.\n')
+        return
+    pct = exact / total * 100
+    print(f'  {gws_with_shots} gameweek(s) · {total} team-matches · '
+          f'{exact} classified exactly as the feed reports ({pct:.1f}%), '
+          f'{off_by} shot(s) misplaced in the rest')
+    print(f'  box split: inside {got_in} vs {rep_in} reported · '
+          f'outside {got_out} vs {rep_out} reported')
+    if pct < 95:
+        print(f'  !! BELOW 95%. The provider has probably rescaled start_x/start_y. '
+              f'Recalibrate SHOT_BOX_X. Until then main() will refuse to apply the '
+              f'split and every goal scores 80.')
+    else:
+        print('  Coordinates behave as calibrated. The 80/100 goal split is sound.')
+    share = (wood_ours / wood_rep * 100) if wood_rep else 0
+    print(f'  woodwork:  {wood_ours} shots with outcome == \'post\' vs {wood_rep} '
+          f'reported at team level ({share:.0f}% credited)')
+    print('  The woodwork shortfall is known and accepted — the feed codes the rest as '
+          'ordinary misses with nothing to tell them apart. hit_woodwork is 0.2% of\n'
+          '  all points, so 27% of it is roughly 1 point per player per season.\n')
+
 
 
 # ---------------------------------------------------------------------------- main
@@ -645,16 +901,6 @@ def main():
               'row (points are unaffected; the RPC joins on gw + player_id).')
     cfg = load_config(os.path.join(ROOT, 'scoring_config_v5.json'))
 
-    understat_path = os.path.join(ROOT, f'understat_goals_{ci_season}.json')
-    understat = None
-    if os.path.exists(understat_path):
-        with open(understat_path) as f:
-            understat = json.load(f)
-        print(f'Using goal-location overlay {os.path.basename(understat_path)} '
-              f'({len(understat)} players)')
-    else:
-        print('No Understat overlay found — every goal scores at the inside-the-box '
-              'rate (see fetch_understat_shots.py).')
 
     lines = [
         '-- ============================================================',
@@ -706,17 +952,97 @@ def main():
 
     import pandas as pd
 
+    # One pass to see whether this season has a shot feed at all. 2025/26 publishes
+    # shots.csv for all 38 gameweeks; a brand-new season publishes none of it until
+    # the first match finishes. The two cases need opposite handling and cannot be
+    # told apart one gameweek at a time:
+    #   - season has no shot feed  -> score every goal at 80 and keep going. Refusing
+    #     to write points at all would be far worse than a 20-point shortfall.
+    #   - season has a shot feed but this gameweek is missing it -> anomalous. Do NOT
+    #     write, because writing would overwrite correct 100-point goals with 80s and
+    #     zero out woodwork on a gameweek that was already scored properly.
+    gw_data = {}
+    season_has_shots = False
+    for gw in gws:
+        gw_data[gw] = fetch_gw(ci_season, gw)
+        if gw_data[gw][3] == 'ok':
+            season_has_shots = True
+    if not season_has_shots:
+        print('  ! No gameweek in this run has shots.csv. Every goal will score at the '
+              'inside-the-box rate (80) and no woodwork will be credited — the '
+              'behaviour before 2026-08-21. Normal before a season\'s first match '
+              'finishes; if it persists into a played gameweek the feed has changed.',
+              file=sys.stderr)
+
     total_rows = total_unmatched = 0
     synced = []
+    degraded = []      # written without a shot split, deliberately
+    blocked = []       # not written at all, to protect rows already scored correctly
     for gw in gws:
-        pms, pgs = fetch_gw(ci_season, gw)
+        pms, pgs, shots, shot_status = gw_data[gw]
         if not pms:
             print(f'  gw{gw}: no player match stats published yet, skipped')
             continue
         ci_matches = fetch_csv_or_none(
             ci_url(ci_season, 'By Tournament', 'Premier League', f'GW{gw}', 'matches.csv'))
+
+        # Only matches playermatchstats has published are in scope, for the shots feed
+        # as well. See summarise_shots() for why the two must agree on WHICH matches.
+        pms_match_ids = {r.get('match_id') for r in pms if r.get('match_id')}
+
+        shot_extra, shot_note = {}, ''
+        if shots:
+            exact, tm, gi, go, ri, ro, off = reconcile_shot_box(
+                shots, ci_matches, pms_match_ids)
+            agree = (exact / tm) if tm else None
+            if agree is not None and agree < SHOT_BOX_MIN_AGREEMENT:
+                print(f'  !! gw{gw}: shot coordinates reconcile with the feed\'s own '
+                      f'inside/outside-box totals for only {exact}/{tm} team-matches '
+                      f'({agree * 100:.0f}%, off by {off} shots). The provider has '
+                      f'probably rescaled start_x/start_y. Discarding the goal split '
+                      f'for this gameweek — every goal scores 80 — and leaving '
+                      f'SHOT_BOX_X to be recalibrated. Woodwork is unaffected.',
+                      file=sys.stderr)
+                shot_extra, _ = summarise_shots(shots, players, pms_match_ids)
+                for e in shot_extra.values():
+                    e['outside'] = 0
+                degraded.append(gw)
+            else:
+                shot_extra, unresolved = summarise_shots(shots, players, pms_match_ids)
+                if unresolved:
+                    frac = unresolved / max(1, len(shots))
+                    print(f'  {"!!" if frac > 0.05 else "!"} gw{gw}: {unresolved} shot '
+                          f'row(s) ({frac * 100:.0f}%) have a player_id that isn\'t in '
+                          f'players.csv and were ignored. Above a few percent this '
+                          f'means shots.csv has changed id space.',
+                          file=sys.stderr)
+                # Coverage: a gameweek published match-by-match can have player stats
+                # for a match whose shots aren't out yet. That is under-credit only
+                # (the match-id filter above stops any over-credit), and the next
+                # scheduled run repairs it — but say so rather than looking complete.
+                shot_match_ids = {r.get('match_id') for r in shots} & pms_match_ids
+                gap = len(pms_match_ids) - len(shot_match_ids)
+                if gap > 0:
+                    print(f'  ! gw{gw}: shots.csv covers {len(shot_match_ids)} of '
+                          f'{len(pms_match_ids)} matches with player stats. Goals in '
+                          f'the other {gap} scored at 80; the next run rescores them.',
+                          file=sys.stderr)
+                if agree is not None:
+                    shot_note = f', box split {exact}/{tm} team-matches exact'
+        elif not season_has_shots:
+            degraded.append(gw)          # expected: the season has no shot feed yet
+        else:
+            reason = ('could not be fetched' if shot_status == 'error'
+                      else 'is missing (404)')
+            print(f'  !! gw{gw}: shots.csv {reason} but other gameweeks in this season '
+                  f'have it. NOT writing this gameweek — doing so would replace '
+                  f'correctly-split goals with flat 80s and wipe its woodwork. It will '
+                  f'be picked up on the next run.', file=sys.stderr)
+            blocked.append(gw)
+            continue
+
         rows, unmatched = build_rows(gw, pms, pgs, players, team_by_id, team_by_code,
-                                     fixture_index, ci_matches, understat)
+                                     fixture_index, ci_matches, shot_extra)
         total_unmatched += unmatched
         if not rows:
             print(f'  gw{gw}: no matchable rows, skipped')
@@ -768,14 +1094,17 @@ def main():
         # only revisits the last few gameweeks, an early one could stay wrong forever
         # with nothing to signal it. Per-gameweek, a failure stops the run with every
         # completed gameweek fully consistent.
+        loc = (f", {int(df['goal_outside_box'].sum())} outside-box goal(s), "
+               f"{int(df['hit_woodwork'].sum())} woodwork{shot_note}" if shots
+               else ', no shots.csv — every goal scored at the inside-box rate')
         if db is not None:
             db.upsert('gw_player_stats', gw_payload, 'gw,player_id')
             db.rpc('compute_all_gw_points', {'p_gw': gw})
             print(f'  gw{gw}: {len(scored)} players scored, written and recomputed'
-                  + (f', {unmatched} unmatched' if unmatched else ''))
+                  + (f', {unmatched} unmatched' if unmatched else '') + loc)
         else:
             print(f'  gw{gw}: {len(scored)} players scored'
-                  + (f', {unmatched} unmatched' if unmatched else ''))
+                  + (f', {unmatched} unmatched' if unmatched else '') + loc)
 
     # Only gameweeks that actually produced rows. Recomputing a gameweek with no
     # stats writes every manager a legitimate-looking zero — which is exactly what
@@ -785,11 +1114,26 @@ def main():
         lines.append(f'select public.compute_all_gw_points({gw});')
     lines.append('')
 
+    if degraded:
+        print(f'\n  ! Gameweek(s) {degraded} were scored without a goal-location split: '
+              f'every goal at 80, no woodwork. Re-run once the feed publishes their '
+              f'shots.csv.', file=sys.stderr)
+    if blocked:
+        print(f'\n  !! Gameweek(s) {blocked} were NOT written — shots.csv was missing or '
+              f'unreachable for them while other gameweeks this season have it. Their '
+              f'existing rows in Supabase are untouched and still correct. Re-run; if '
+              f'it repeats, check the feed.', file=sys.stderr)
+
+    # A blocked gameweek is a real problem worth a red build: the feed has a shot
+    # file for this season but not for that gameweek. A degraded one is not — it is
+    # the normal state before a season's first match finishes.
+    rc = 1 if blocked else 0
+
     if not total_rows:
         print('\nNo player rows produced — no points written.'
               + (' Fixtures were still updated.' if (db is not None and fixture_payload)
                  else ''))
-        return 0
+        return rc
 
     if db is None:
         with open(out_path, 'w') as f:
@@ -798,12 +1142,12 @@ def main():
               f'{len(synced)} gameweek(s)'
               + (f', {total_unmatched} unmatched' if total_unmatched else '') + '.')
         print('Paste it into the Supabase SQL Editor and Run.')
-        return 0
+        return rc
 
     print(f'\nDone — {total_rows} player-gameweek rows across {len(synced)} gameweek(s)'
           + (f', {total_unmatched} unmatched' if total_unmatched else '')
           + ('  [dry run — nothing actually written]' if dry_run else '') + '.')
-    return 0
+    return rc
 
 
 if __name__ == '__main__':

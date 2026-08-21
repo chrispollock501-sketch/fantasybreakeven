@@ -73,10 +73,23 @@ an upsert, so re-running is always safe.
 hour after each so they never race it. Saturday-evening matches appear in Sunday
 morning's run; a full weekend is settled by Monday morning.
 
-**If the Understat step fails**, the sync still runs. Understat only supplies the
-inside-vs-outside-the-box goal split, worth about 2.2% of all points. A failure there
-leaves every goal scoring 80 instead of some scoring 100, and posts a warning on the
-run. It is never allowed to stop points being scored.
+**Goal locations.** The inside-vs-outside-the-box split (80 vs 100 points) comes from
+`shots.csv`, published in the same gameweek folder as the rest of the stats. There is
+nothing extra to run or schedule for it. Two things worth knowing when you read a run's
+log:
+
+- If a gameweek's `shots.csv` hasn't been published yet, the sync says so and scores
+  every goal at 80. That's normal before a season's first match finishes, and the next
+  run rescores it.
+- If some gameweeks have `shots.csv` and one doesn't, the sync **refuses to write that
+  gameweek** and exits with an error, turning the run red. That's deliberate: writing
+  would replace correctly-split goals with flat 80s on a gameweek already scored
+  properly. Just re-run it.
+
+The sync also re-checks its own box classification against the feed's published
+inside/outside-box totals on every run, and throws the split away for any gameweek where
+they stop agreeing — so if the provider ever moves its pitch coordinates, the worst case
+is goals scoring 80 again, not a tap-in paying 100.
 
 ## Running it by hand when you need to
 
