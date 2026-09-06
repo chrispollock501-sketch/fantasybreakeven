@@ -132,6 +132,95 @@ AUDITED = [
 ]
 
 
+# Feed columns that score points AND are common enough that a gameweek with none
+# of them at all is a broken feed rather than an unusual round. The percentages
+# are each column's non-zero share across the whole of 2025/26, measured with
+# --audit; every one is comfortably into double figures, so 0% in a gameweek of
+# 400 rows cannot happen by chance.
+#
+# WHY THIS RUNS ON EVERY SYNC RATHER THAN ONLY UNDER --audit:
+# The scheduled job has never run --audit, and in 2026/27 GW1 the provider
+# shipped `tackles` and `successful_dribbles` as present-but-entirely-empty
+# columns. Nothing errored. defcon_cbit is tackles+interceptions+blocks+
+# clearances at 3 points each and defcon is about a fifth of all scoring, so
+# roughly 6% of the league's points quietly stopped existing — concentrated on
+# defenders, which is exactly the position-biased distortion part 4 was written
+# to prevent, and it would have gone into the price economy at GW3.
+#
+# This is the same lesson as the shots fail-safe: a silent zero is the dangerous
+# failure, so make it loud on every single run.
+COMMON_SCORING_STATS = {
+    'chances_created':        ('chance_created', 30),
+    'touches_opposition_box': ('touch_opp_box', 44),
+    'successful_dribbles':    ('successful_dribble', 25),
+    'accurate_crosses':       ('accurate_cross', 15),
+    'aerial_duels_won':       ('aerial_won', 37),
+    'was_fouled':             ('was_fouled', 35),
+    'fouls_committed':        ('foul_committed', 39),
+    'dribbled_past':          ('dribbled_past', 24),
+    'shots_on_target':        ('shot_on_target', 18),
+    # A tuple key means "any one of these columns carrying data is fine". The
+    # provider dropped the attempted/won tackle split for 2026/27: `tackles` and
+    # `tackles_won_percent` are blank on every row and the single remaining
+    # figure is published as `tackles_won`. derive() reads whichever is present,
+    # so the alarm should only sound when BOTH are empty. See defcon_cbit in
+    # scoring.py.
+    ('tackles', 'tackles_won'): ('defcon_cbit', 35),
+    'interceptions':          ('defcon_cbit', 26),
+    'blocks':                 ('defcon_cbit', 14),
+    'clearances':             ('defcon_cbit', 43),
+    'recoveries':             ('recovery', 66),
+    'saves':                  ('save', 5),
+}
+COVERAGE_MIN_ROWS = 100          # below this a gameweek is too partial to judge
+
+
+def check_stat_coverage(gw, pms, cfg=None):
+    """Warn when a stat that earns points is completely absent from a gameweek.
+
+    Returns the list of dead column names, so callers can decide what to do.
+    Deliberately does NOT block the write: the points are still mostly right, and
+    refusing to publish a gameweek over this would leave managers with nothing at
+    all. Loud, not fatal.
+    """
+    rows = pms or []
+    if len(rows) < COVERAGE_MIN_ROWS:
+        return []
+    scored = set()
+    if cfg:
+        scored = {k for k, v in cfg.get('stats', {}).items()
+                  if (max(v.values()) if isinstance(v, dict) else v)}
+    dead = []
+    for col, (stat, expected) in COMMON_SCORING_STATS.items():
+        if scored and stat not in scored:
+            continue                       # not scored in this config, so not a problem
+        # A tuple key lists interchangeable spellings of the same underlying
+        # stat; the feed only has to publish one of them.
+        cols = col if isinstance(col, tuple) else (col,)
+        n = 0
+        for r in rows:
+            for c in cols:
+                v = (r.get(c) or '').strip() if isinstance(r.get(c), str) else r.get(c)
+                try:
+                    if v not in (None, '') and float(v) != 0:
+                        n += 1
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if n:
+                break
+        if n == 0:
+            dead.append((' / '.join(cols), stat, expected))
+    if dead:
+        for col, stat, expected in dead:
+            print(f'  !! gw{gw}: `{col}` is empty for all {len(rows)} rows. It was '
+                  f'non-zero on ~{expected}% of appearances in 2025/26 and it feeds '
+                  f'`{stat}`, which scores. Those points are NOT being awarded. '
+                  f'Check whether the provider has renamed or dropped the column.',
+                  file=sys.stderr)
+    return [c for c, _s, _e in dead]
+
+
 # --------------------------------------------------------------------------- fetch
 
 def fetch_csv(url, timeout=25):
@@ -182,13 +271,44 @@ def pick_season(override=None):
 
 # ------------------------------------------------------------------------ reference
 
+def pid_key(v):
+    """Normalise a Core-Insights player_id to one canonical string form.
+
+    The provider is not consistent about how it spells this id, and the
+    inconsistency is silent rather than fatal. In 2025/26 every feed wrote plain
+    integers ('14'). In 2026/27 shots.csv writes floats ('14.0') while
+    playermatchstats.csv still writes integers, so a bare string compare against
+    players.csv resolved 0 of 277 shot rows in GW1 — every goal fell into the
+    inside-the-box bucket at 80 and woodwork never scored at all.
+
+    Normalising BOTH the dict keys and every lookup through here means the match
+    survives either spelling, in either feed, in either direction. Anything that
+    isn't a whole number is returned untouched rather than guessed at.
+    """
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        f = float(s)
+    except (TypeError, ValueError):
+        return s
+    if not math.isfinite(f) or f != int(f):
+        return s
+    return str(int(f))
+
+
 def load_players(ci_season):
     """player_id (Core-Insights, season-scoped) -> {code, position, web_name}."""
     rows = fetch_csv(ci_url(ci_season, 'players.csv'))
     out = {}
     for r in rows:
+        key = pid_key(r.get('player_id'))
+        if key is None:
+            continue
         try:
-            out[r['player_id']] = {
+            out[key] = {
                 'code': int(r['player_code']),
                 'position': r['position'],
                 'web_name': r.get('web_name', ''),
@@ -226,8 +346,8 @@ def load_fpl_fixtures(fpl_season):
     fixtures, index = [], {}
     for r in rows:
         try:
-            fid = int(r['id'])
-            gw = int(r['event']) if r.get('event') else None
+            fid = int(float(r['id']))
+            gw = int(float(r['event'])) if r.get('event') else None
             home = id_to_short.get(str(int(float(r['team_h']))))
             away = id_to_short.get(str(int(float(r['team_a']))))
         except (KeyError, ValueError, TypeError):
@@ -235,8 +355,11 @@ def load_fpl_fixtures(fpl_season):
         f = {
             'id': fid, 'gw': gw, 'home': home, 'away': away,
             'kickoff_time': r.get('kickoff_time') or None,
-            'home_score': r.get('team_h_score') or None,
-            'away_score': r.get('team_a_score') or None,
+            # Coerced here, not at the point of use: everything downstream then
+            # gets a clean int-or-None and cannot be surprised by a float
+            # spelling. See int_or_none().
+            'home_score': int_or_none(r.get('team_h_score')),
+            'away_score': int_or_none(r.get('team_a_score')),
             'finished': (r.get('finished') or '').strip() == 'True',
         }
         # fixtures.home_club / away_club are NOT NULL. A fixture whose clubs couldn't
@@ -266,11 +389,37 @@ def num(v):
             return 0
 
 
+def int_or_none(v):
+    """Coerce a feed value to int, tolerating float spellings ('3.0') and blanks.
+
+    Feed providers reformat columns without warning and it has bitten this
+    project twice now. Core-Insights started writing shots.csv player ids as
+    '14.0' where players.csv still said '14', which silently discarded 100% of
+    shots; then the vaastav mirror started writing fixture scores as '3.0'
+    where it used to write '3', and a bare int() raised ValueError right in the
+    middle of building the fixtures payload — killing the whole push before a
+    single point was written.
+
+    Anything unparseable becomes None rather than a wrong number, because a
+    missing score renders as "not known yet" while a wrong one is a lie.
+    """
+    if v in (None, '', 'None'):
+        return None
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
 MATCH_SUM_KEYS = [
     'minutes_played', 'goals', 'assists', 'penalties_scored', 'penalties_missed',
     'shots_on_target', 'chances_created', 'touches_opposition_box',
     'successful_dribbles', 'accurate_crosses', 'was_fouled', 'fouls_committed',
     'dribbled_past', 'aerial_duels_won', 'ground_duels_won', 'tackles',
+    # `tackles_won` is carried alongside `tackles` because the provider stopped
+    # publishing the latter in 2026/27; derive() falls back to it. Summing both
+    # is harmless when both are present — only one is ever read.
+    'tackles_won',
     'interceptions', 'blocks', 'clearances', 'recoveries', 'saves',
     'goals_prevented', 'sweeper_actions', 'high_claim', 'final_third_passes',
 ]
@@ -359,7 +508,12 @@ def shot_inside_box(row):
 
 
 def summarise_shots(shots, players, match_ids=None):
-    """shots.csv rows -> ({player_code: {'outside': n, 'post': n}}, unresolved_count).
+    """shots.csv rows -> ({player_code: {'outside': n, 'post': n}}, unresolved, unattributed).
+
+    `unresolved` counts shots carrying a player_id that players.csv does not know —
+    the signal that the id space has moved. `unattributed` counts shots the feed
+    published with no player_id at all, which is normal and is reported separately
+    so it can never be mistaken for the former.
 
     Only the outside-the-box count is carried, not the inside one: playermatchstats
     is authoritative for how many goals a player scored, so inside is derived as
@@ -383,10 +537,19 @@ def summarise_shots(shots, players, match_ids=None):
     """
     extra = {}
     unresolved = 0
+    unattributed = 0
     for r in shots or []:
         if match_ids is not None and r.get('match_id') not in match_ids:
             continue
-        meta = players.get(r.get('player_id'))
+        key = pid_key(r.get('player_id'))
+        if key is None:
+            # The feed itself leaves player_id blank on some shots (35 of 277 in
+            # 2026/27 GW1). Nothing can be credited for those, but they are NOT
+            # evidence the id space has changed — counting them as unresolved is
+            # what would turn a healthy run into a permanent false alarm.
+            unattributed += 1
+            continue
+        meta = players.get(key)
         if meta is None:
             unresolved += 1
             continue
@@ -400,7 +563,7 @@ def summarise_shots(shots, players, match_ids=None):
                 continue
             if not shot_inside_box(r):
                 e['outside'] += 1
-    return extra, unresolved
+    return extra, unresolved, unattributed
 
 
 def reconcile_shot_box(shots, matches, match_ids=None):
@@ -502,7 +665,7 @@ def build_rows(gw, pms, pgs, players, team_by_id, team_by_code, fixture_index,
     by_code = {}
     unmatched = 0
     for r in pms or []:
-        meta = players.get(r.get('player_id'))
+        meta = players.get(pid_key(r.get('player_id')))
         if meta is None:
             unmatched += 1
             continue
@@ -533,7 +696,7 @@ def build_rows(gw, pms, pgs, players, team_by_id, team_by_code, fixture_index,
     # FPL-official per-gameweek fields, keyed on the same Core-Insights player_id.
     fpl_by_code = {}
     for r in pgs or []:
-        meta = players.get(r.get('id'))
+        meta = players.get(pid_key(r.get('id')))
         if meta is None:
             continue
         fpl_by_code[meta['code']] = r
@@ -640,6 +803,68 @@ class Supabase:
                        {'Prefer': 'resolution=merge-duplicates,return=minimal'})
             done += len(batch)
         return done
+
+    def _get(self, path, headers=None):
+        req = urllib.request.Request(self.url + path,
+                                     headers=self._headers(headers), method='GET')
+        try:
+            with self._opener.open(req, timeout=60) as r:
+                return r.status, r.read().decode('utf-8', 'replace'), dict(r.headers)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode('utf-8', 'replace')[:800]
+            raise RuntimeError(f'{path} -> HTTP {e.code}: {detail}') from None
+
+    def select(self, table, columns='*', query='', page=1000):
+        """Read every row of a table, following PostgREST's pagination.
+
+        PostgREST caps a response (Supabase's default max-rows is 1000) and says
+        so ONLY in the Content-Range header — an over-long result comes back as a
+        200 with a short body, not an error. Reading gw_player_stats for a whole
+        season is ~21,000 rows, so a single unpaged GET would silently return the
+        first 1,000 and the pricing job would reprice the league off a fifth of
+        the evidence, with nothing anywhere to indicate it. Hence explicit paging
+        with an exact-count assertion at the end.
+        """
+        rows = []
+        offset = 0
+        while True:
+            q = f'/rest/v1/{table}?select={urllib.parse.quote(columns)}'
+            if query:
+                q += '&' + query
+            status, body, headers = self._get(
+                q, {'Range-Unit': 'items',
+                    'Range': f'{offset}-{offset + page - 1}',
+                    'Prefer': 'count=exact'})
+            batch = json.loads(body) if body.strip() else []
+            rows.extend(batch)
+            cr = headers.get('Content-Range', '')
+            total = None
+            if '/' in cr:
+                tail = cr.rsplit('/', 1)[1].strip()
+                if tail.isdigit():
+                    total = int(tail)
+            if not batch:
+                break
+            offset += len(batch)
+            # Advance by what the server ACTUALLY returned, and trust the count
+            # over the requested page size. PostgREST's own db-max-rows can be
+            # lower than the range we asked for, so "we got back fewer rows than
+            # we asked for" does NOT mean "that was the last page" — treating it
+            # that way silently truncates the read to one server page and would
+            # reprice the league off a fraction of the season.
+            if total is not None:
+                if offset >= total:
+                    break
+            elif len(batch) < page:
+                break
+            if offset > 500000:
+                raise RuntimeError(f'{table}: pagination did not terminate')
+        if total is not None and len(rows) != total:
+            raise RuntimeError(
+                f'{table}: read {len(rows)} rows but the server reports {total}. '
+                f'Refusing to continue — a partial read here would silently reprice '
+                f'the league off incomplete data.')
+        return rows
 
     def rpc(self, name, args):
         json.dumps(args, allow_nan=False)
@@ -915,16 +1140,73 @@ def main():
     gw_set = set(gws)
     fx = [f for f in fixtures if f['gw'] in gw_set]
 
+    # ---- results come from Core-Insights, not from the FPL mirror ----------------
+    # The vaastav mirror is not being maintained for 2026/27: six days after GW1 was
+    # played, every one of its ten fixtures still reads finished=False with both
+    # scores blank. Taken at face value that means fixtures.finished is false for
+    # matches that finished last week, which breaks three things at once —
+    # gw_scoring_progress() reports "0 of 10 finished", the client's gwAllScored()
+    # fallback can never fire, and the pricing job's "is this gameweek complete?"
+    # test never becomes true, so prices would never move at all.
+    #
+    # Core-Insights' own matches.csv carries finished, home_score and away_score and
+    # is current — it is the same file already used for the shot reconciliation, and
+    # it is joined the same way (team CODES via short names; see load_fpl_fixtures).
+    # The mirror still supplies fixture IDs and kick-off times, because fixtures.id
+    # must remain an FPL fixture id.
+    results = {}
+    for gw in gws:
+        for m in (fetch_csv_or_none(
+                ci_url(ci_season, 'By Tournament', 'Premier League', f'GW{gw}',
+                       'matches.csv')) or []):
+            try:
+                h = team_by_code.get(str(int(float(m['home_team']))))
+                a = team_by_code.get(str(int(float(m['away_team']))))
+                g = int(float(m['gameweek']))
+            except (KeyError, ValueError, TypeError):
+                continue
+            if not (h and a):
+                continue
+            fid = fixture_index.get((g, h, a)) or fixture_index.get((g, a, h))
+            if fid is None:
+                continue
+
+            _score = int_or_none
+            results[fid] = {
+                'finished': (str(m.get('finished') or '').strip().lower() == 'true'),
+                'home_score': _score(m.get('home_score')),
+                'away_score': _score(m.get('away_score')),
+            }
+
+    def _pick(f, key, mirror_val):
+        """Prefer the live feed; fall back to the mirror rather than to nothing."""
+        r = results.get(f['id'])
+        if r is None:
+            return mirror_val
+        v = r[key]
+        if key == 'finished':
+            # Never un-finish a match. If either source says it is done, it is done.
+            return bool(v or mirror_val)
+        return v if v is not None else mirror_val
+
     # Rows are built once, in the shape the table expects, and then either rendered
     # as SQL or POSTed. One source of truth for what gets written, so the pasted and
     # the automated paths can never diverge.
     fixture_payload = [{
         'id': f['id'], 'gw': f['gw'], 'home_club': f['home'], 'away_club': f['away'],
         'kickoff_time': f['kickoff_time'],
-        'home_score': int(f['home_score']) if f['home_score'] not in (None, '') else None,
-        'away_score': int(f['away_score']) if f['away_score'] not in (None, '') else None,
-        'finished': bool(f['finished']),
+        'home_score': _pick(f, 'home_score', f['home_score']),
+        'away_score': _pick(f, 'away_score', f['away_score']),
+        'finished': _pick(f, 'finished', bool(f['finished'])),
     } for f in fx]
+
+    n_fin = sum(1 for r in fixture_payload if r['finished'])
+    if results:
+        print(f'  results overlay: {len(results)} match(es) from Core-Insights, '
+              f'{n_fin} of {len(fixture_payload)} fixture(s) marked finished')
+    elif fx:
+        print('  ! no Core-Insights results available; falling back to the FPL '
+              'mirror, which has not been updated for 2026/27.', file=sys.stderr)
 
     # Fixtures go in before any player row, because gw_player_stats.fixture_id is a
     # foreign key onto this table. Done here rather than at the end so a run that
@@ -933,17 +1215,22 @@ def main():
         n = db.upsert('fixtures', fixture_payload, 'id')
         print(f'  fixtures        {n} rows upserted')
 
-    if fx:
+    # Rendered from fixture_payload, NOT from fx. The comment above claims one source
+    # of truth so the pasted and automated paths cannot diverge — but this block used
+    # to read the raw mirror rows, so it was quietly the one place the claim was
+    # false. The results overlay made that visible: the push wrote finished=true and
+    # the pasted SQL wrote finished=false for the same ten matches.
+    if fixture_payload:
         lines.append('insert into public.fixtures')
         lines.append('  (id, gw, home_club, away_club, kickoff_time, home_score, away_score, finished, updated_at)')
         lines.append('values')
         lines.append(',\n'.join(
             '  ({id}, {gw}, {h}, {a}, {kt}, {hs}, {as_}, {fin}, now())'.format(
                 id=f['id'], gw=f['gw'],
-                h=sql_str(f['home']), a=sql_str(f['away']),
+                h=sql_str(f['home_club']), a=sql_str(f['away_club']),
                 kt=sql_str(f['kickoff_time']) if f['kickoff_time'] else 'null',
                 hs=sql_val(f['home_score']), as_=sql_val(f['away_score']),
-                fin='true' if f['finished'] else 'false') for f in fx))
+                fin='true' if f['finished'] else 'false') for f in fixture_payload))
         lines.append('on conflict (id) do update set')
         lines.append('  gw = excluded.gw, home_club = excluded.home_club, away_club = excluded.away_club,')
         lines.append('  kickoff_time = excluded.kickoff_time, home_score = excluded.home_score,')
@@ -978,11 +1265,14 @@ def main():
     synced = []
     degraded = []      # written without a shot split, deliberately
     blocked = []       # not written at all, to protect rows already scored correctly
+    dead_stats = []    # scoring stats the feed published empty — loud, but not fatal
     for gw in gws:
         pms, pgs, shots, shot_status = gw_data[gw]
         if not pms:
             print(f'  gw{gw}: no player match stats published yet, skipped')
             continue
+        # Every run, not just under --audit. See COMMON_SCORING_STATS.
+        dead_stats.extend((gw, c) for c in check_stat_coverage(gw, pms, cfg))
         ci_matches = fetch_csv_or_none(
             ci_url(ci_season, 'By Tournament', 'Premier League', f'GW{gw}', 'matches.csv'))
 
@@ -1003,19 +1293,27 @@ def main():
                       f'for this gameweek — every goal scores 80 — and leaving '
                       f'SHOT_BOX_X to be recalibrated. Woodwork is unaffected.',
                       file=sys.stderr)
-                shot_extra, _ = summarise_shots(shots, players, pms_match_ids)
+                shot_extra, _, _ = summarise_shots(shots, players, pms_match_ids)
                 for e in shot_extra.values():
                     e['outside'] = 0
                 degraded.append(gw)
             else:
-                shot_extra, unresolved = summarise_shots(shots, players, pms_match_ids)
+                shot_extra, unresolved, unattributed = summarise_shots(
+                    shots, players, pms_match_ids)
                 if unresolved:
                     frac = unresolved / max(1, len(shots))
                     print(f'  {"!!" if frac > 0.05 else "!"} gw{gw}: {unresolved} shot '
-                          f'row(s) ({frac * 100:.0f}%) have a player_id that isn\'t in '
+                          f'row(s) ({frac * 100:.0f}%) carry a player_id that isn\'t in '
                           f'players.csv and were ignored. Above a few percent this '
-                          f'means shots.csv has changed id space.',
+                          f'means shots.csv has changed id space — check whether the '
+                          f'ids need normalising (see pid_key).',
                           file=sys.stderr)
+                if unattributed:
+                    frac = unattributed / max(1, len(shots))
+                    print(f'  ! gw{gw}: {unattributed} shot row(s) '
+                          f'({frac * 100:.0f}%) were published with no player_id at '
+                          f'all and cannot be credited. This is the feed\'s own gap, '
+                          f'not an id-space change.', file=sys.stderr)
                 # Coverage: a gameweek published match-by-match can have player stats
                 # for a match whose shots aren't out yet. That is under-credit only
                 # (the match-id filter above stops any over-credit), and the next
@@ -1118,6 +1416,14 @@ def main():
         print(f'\n  ! Gameweek(s) {degraded} were scored without a goal-location split: '
               f'every goal at 80, no woodwork. Re-run once the feed publishes their '
               f'shots.csv.', file=sys.stderr)
+    if dead_stats:
+        cols = sorted({c for _g, c in dead_stats})
+        print(f'\n  !! FEED GAP: {", ".join(cols)} came through empty for every player '
+              f'in gameweek(s) {sorted({g for g, _c in dead_stats})}. These stats score '
+              f'points and are not being awarded. This is not a crash and the rest of '
+              f'the gameweek is correct, but it moves points unevenly between positions '
+              f'and it feeds straight into pricing — do not leave it unexamined.',
+              file=sys.stderr)
     if blocked:
         print(f'\n  !! Gameweek(s) {blocked} were NOT written — shots.csv was missing or '
               f'unreachable for them while other gameweeks this season have it. Their '

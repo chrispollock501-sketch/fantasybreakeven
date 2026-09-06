@@ -48,7 +48,29 @@ def derive(df: pd.DataFrame) -> pd.DataFrame:
     out['hit_woodwork']      = z('hit_woodwork')
 
     # --- defending / duels ---
-    out['defcon_cbit']       = z('tackles') + z('interceptions') + z('blocks') + z('clearances')
+    # The tackle count is read from `tackles`, falling back to `tackles_won`
+    # per row where `tackles` is zero or absent.
+    #
+    # Why: for 2026/27 the provider dropped the attempted/won distinction.
+    # `tackles` and `tackles_won_percent` are blank on every row of GW1, GW2 and
+    # GW3, and the single surviving figure is published as `tackles_won`. It is a
+    # rename, not a redefinition — measured per appearance, 2026/27 `tackles_won`
+    # is 1.05 against a 2025/26 `tackles` of 1.11 and a 2025/26 `tackles_won` of
+    # 0.67. Reading it therefore restores the calibration rather than changing
+    # the rules: CBIT per appearance goes 2.43 -> 3.48 against a 2025/26
+    # baseline of 3.76.
+    #
+    # The fallback is row-level and keyed on `tackles` being zero, which is a
+    # strict no-op on 2025/26: across 983 sampled rows there is not one where
+    # `tackles` is 0 while `tackles_won` is positive (a won tackle is a subset of
+    # an attempted one), so last season re-scores bit-for-bit identically.
+    tackles = z('tackles')
+    tackles_won = z('tackles_won')
+    if hasattr(tackles, 'where'):
+        tackle_count = tackles.where(tackles > 0, tackles_won)
+    else:                                    # column absent entirely
+        tackle_count = tackles_won
+    out['defcon_cbit']       = tackle_count + z('interceptions') + z('blocks') + z('clearances')
     out['recovery']          = z('recoveries')
     out['aerial_won']        = z('aerial_duels_won')
     out['ground_duel_won']   = z('ground_duels_won')
