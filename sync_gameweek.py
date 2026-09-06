@@ -478,10 +478,30 @@ def fetch_gw(ci_season, gw):
 # from that sliver, so the honest geometric value is used.
 #
 # reconcile_shot_box() re-runs this check on EVERY sync, not only under --audit, and
-# a gameweek that falls below SHOT_BOX_MIN_AGREEMENT has its split discarded (every
-# goal reverts to 80) with a loud warning. Worst single gameweek in 2025/26 was 18/20
-# = 90%, so the floor is set well under that: a genuine rescale scores near zero.
-SHOT_BOX_MIN_AGREEMENT = 0.70
+# a gameweek that fails it has its split discarded (every goal reverts to 80) with a
+# loud warning.
+#
+# HOW THE CHECK IS MEASURED — changed 2026-09-06, and the old way was wrong.
+#
+# It used to require whole TEAM-MATCHES to match exactly, and pass only if 70% of
+# them did. A team-match is about 7 shots, so a single shot sitting within a metre
+# of the line flips the whole team-match from "exact" to "wrong". That is a
+# hair-trigger, and it fired: 2026/27 GW2 scored 13/20 = 65%, its goal split was
+# thrown away, and every goal in the round paid 80 with no woodwork — while the
+# actual classification was 184 inside against the provider's 186, i.e. **99.3%
+# right**. Four outside-box goals and two woodwork hits were silently dropped for
+# no reason.
+#
+# It is now measured per SHOT: the total misclassified shots as a share of all
+# shots. That is the quantity that actually matters, because a goal is credited
+# per shot, and it is immune to the team-match granularity problem. A genuine
+# rescale — the thing this defends against — still scores near 1.0: shifting every
+# start_x by +40 misclassifies essentially every shot.
+#
+# Measured error rates: 2026/27 GW1 0.4%, GW2 3.3%, GW3 2.1%; worst 2025/26
+# gameweek well inside the limit. 10% leaves a wide margin over real noise while
+# catching anything structural.
+SHOT_BOX_MAX_SHOT_ERROR = 0.10
 SHOT_BOX_X = 16.95
 SHOT_BOX_Y_LO = (68 - 40.32) / 2 / 68 * 100      # 20.35
 SHOT_BOX_Y_HI = 100 - SHOT_BOX_Y_LO              # 79.65
@@ -965,7 +985,7 @@ def audit_shot_coordinates(ci_season, gws, shots_by_gw):
     On 2025/26 the box split agrees exactly for 751 of 760 team-matches. Anything
     below about 95% means the coordinates have moved and SHOT_BOX_X needs
     recalibrating — main() independently refuses to apply a split below
-    SHOT_BOX_MIN_AGREEMENT, so a rescale costs 20 points a goal, never 100 points on
+    SHOT_BOX_MAX_SHOT_ERROR, so a rescale costs 20 points a goal, never 100 points on
     a tap-in."""
     print('Shot reconciliation against the feed\'s own team-level totals')
     exact = total = got_in = got_out = rep_in = rep_out = off_by = 0
@@ -1284,14 +1304,20 @@ def main():
         if shots:
             exact, tm, gi, go, ri, ro, off = reconcile_shot_box(
                 shots, ci_matches, pms_match_ids)
-            agree = (exact / tm) if tm else None
-            if agree is not None and agree < SHOT_BOX_MIN_AGREEMENT:
-                print(f'  !! gw{gw}: shot coordinates reconcile with the feed\'s own '
-                      f'inside/outside-box totals for only {exact}/{tm} team-matches '
-                      f'({agree * 100:.0f}%, off by {off} shots). The provider has '
-                      f'probably rescaled start_x/start_y. Discarding the goal split '
-                      f'for this gameweek — every goal scores 80 — and leaving '
-                      f'SHOT_BOX_X to be recalibrated. Woodwork is unaffected.',
+            # Misclassified shots as a share of all shots the feed published for
+            # the matches being scored. See SHOT_BOX_MAX_SHOT_ERROR for why this
+            # is measured per shot rather than per team-match.
+            classified = gi + go
+            err = (off / classified) if classified else None
+            if err is not None and err > SHOT_BOX_MAX_SHOT_ERROR:
+                print(f'  !! gw{gw}: {off} of {classified} shots ({err * 100:.0f}%) '
+                      f'are classified inside/outside the box differently from the '
+                      f'feed\'s own team totals — we make it {gi} inside / {go} '
+                      f'outside against their {ri} / {ro}, and only {exact}/{tm} '
+                      f'team-matches agree exactly. The provider has probably '
+                      f'rescaled start_x/start_y. Discarding the goal split for this '
+                      f'gameweek — every goal scores 80 — and leaving SHOT_BOX_X to '
+                      f'be recalibrated. Woodwork is unaffected.',
                       file=sys.stderr)
                 shot_extra, _, _ = summarise_shots(shots, players, pms_match_ids)
                 for e in shot_extra.values():
@@ -1325,8 +1351,9 @@ def main():
                           f'{len(pms_match_ids)} matches with player stats. Goals in '
                           f'the other {gap} scored at 80; the next run rescores them.',
                           file=sys.stderr)
-                if agree is not None:
-                    shot_note = f', box split {exact}/{tm} team-matches exact'
+                if err is not None:
+                    shot_note = (f', box split {(1 - err) * 100:.0f}% of shots agree '
+                                 f'with the feed ({exact}/{tm} team-matches exact)')
         elif not season_has_shots:
             degraded.append(gw)          # expected: the season has no shot feed yet
         else:

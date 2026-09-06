@@ -242,7 +242,13 @@ def replay(opening_prices, stats_by_gw, up_to_gw,
         for pid, score, minutes, p_before, be_before in appeared:
             avg = rolling([s for s, _m in forms[pid]])
             target = mn * avg
-            move = clip(target - p_before, -max_move, max_move)
+            # max_move may be a number (a flat ±£m cap) or a callable taking the
+            # player's current price, which is how a PROPORTIONAL cap is
+            # expressed — £0.30m is 7.5% of a £4.00m player and 2% of a £15m
+            # one, so a flat cap moves the cheap end of the market several times
+            # faster than the expensive end.
+            cap = max_move(p_before) if callable(max_move) else max_move
+            move = clip(target - p_before, -cap, cap)
             p_after = round(clip(p_before + move, floor, ceil), 2)
             price[pid] = p_after
             history.append(dict(gw=gw, player_id=pid, score=score, minutes=minutes,
