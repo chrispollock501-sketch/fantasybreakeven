@@ -248,6 +248,31 @@ def fetch_csv_or_none(url, timeout=25, only_404=False):
         return None
 
 
+def finished_without_stats(ci_matches, pms_match_ids, team_by_code):
+    """Matches the feed calls finished but has published no player rows for.
+
+    Returned as a sorted list of 'HUL v AVL' labels, empty when the gameweek is
+    whole. Split out of the sync loop so it can be tested directly; see the long
+    note at the call site for why it matters.
+
+    `finished` is read leniently ('True', 'true', '1', True) because the two
+    feeds have never agreed on how to spell a boolean, and team ids arrive as
+    floats ('88.0') here while teams.csv writes them as integers — pid_key
+    reconciles both. A match whose clubs cannot be resolved is still reported,
+    with '?' for the unknown side: a gap we cannot name is still a gap.
+    """
+    out = []
+    for m in ci_matches or ():
+        if str(m.get('finished', '')).strip().lower() not in ('true', '1'):
+            continue
+        if m.get('match_id') in pms_match_ids:
+            continue
+        h = team_by_code.get(pid_key(m.get('home_team'))) or '?'
+        a = team_by_code.get(pid_key(m.get('away_team'))) or '?'
+        out.append(f'{h} v {a}')
+    return sorted(out)
+
+
 def ci_url(season, *parts):
     return CI + '/' + season + '/' + '/'.join(urllib.parse.quote(p) for p in parts)
 
@@ -1299,6 +1324,33 @@ def main():
         # Only matches playermatchstats has published are in scope, for the shots feed
         # as well. See summarise_shots() for why the two must agree on WHICH matches.
         pms_match_ids = {r.get('match_id') for r in pms if r.get('match_id')}
+
+        # A FINISHED MATCH WITH NO PLAYER ROWS AT ALL.
+        #
+        # The provider publishes a gameweek match by match, and matches.csv can
+        # mark a match finished hours before its playermatchstats rows appear.
+        # 2026/27 GW3 did exactly that: Hull 0-0 Villa was finished with a score,
+        # and not one of the ~22 players who played in it had a row — so every
+        # Hull and Villa player scored nothing for the round.
+        #
+        # Nothing downstream is CORRUPTED by this. price_gameweek's
+        # last_complete_gw() refuses a gameweek where any club is below
+        # MIN_PLAYERS_PER_CLUB, so no price can be computed off half a round, and
+        # the pipeline is a pure replay, so the next run writes the rows in and
+        # the points appear with no manual repair.
+        #
+        # What was missing was anyone SAYING SO. The shots feed had this warning
+        # and player stats did not, so the gap was invisible until a player was
+        # noticed missing by hand. Loud, by fixture, every run.
+        if ci_matches:
+            silent = finished_without_stats(ci_matches, pms_match_ids, team_by_code)
+            if silent:
+                print(f'  !! gw{gw}: {len(silent)} finished match(es) have NO player '
+                      f'stats published — {", ".join(silent)}. Every player '
+                      f'in them scores nothing for this gameweek until the provider '
+                      f'catches up. Pricing is protected (last_complete_gw refuses a '
+                      f'gameweek with a club below its minimum) and the next run '
+                      f'repairs the points by itself.', file=sys.stderr)
 
         shot_extra, shot_note = {}, ''
         if shots:
