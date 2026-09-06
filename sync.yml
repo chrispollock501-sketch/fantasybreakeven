@@ -1,12 +1,37 @@
 name: Sync gameweek points
 
-# Core-Insights refreshes twice a day, at 07:30 and 17:30 UTC. These runs sit an
-# hour after each refresh so they always see the newest data rather than racing it.
-# 08:30 UTC = 18:30 Brisbane · 18:30 UTC = 04:30 Brisbane next day.
+# ── SCHEDULE ─────────────────────────────────────────────────────────────────
+# Previously twice a day (08:30 / 18:30 UTC). GitHub delays scheduled jobs by up
+# to ~90 minutes on top of that, so the worst case between a final whistle and a
+# visible score was about 13 hours.
+#
+# Now: every 15 minutes through the windows when Premier League matches are
+# actually being played, and four times a day otherwise.
+#
+# THE BUDGET, because this is the real constraint:
+# GitHub bills a private repo's Actions usage in WHOLE MINUTES per run. These
+# jobs take ~30 seconds and are therefore charged a minute each.
+#     Sat + Sun    11:00-22:59, every 15 min   = 96 runs/week
+#     Mon Tue Wed Fri 18:00-22:59, every 15 min = 80 runs/week
+#     baseline     4x daily                     = 28 runs/week
+#     total                        ~204/week   ~= 890 minutes/month
+# against a 2,000-minute free allowance. That leaves real headroom. If you ever
+# want tighter than 15 minutes, make this repo public — Actions minutes are
+# unlimited for public repos, and nothing secret lives in the code (the keys are
+# in repository Secrets).
+#
+# There is a hard floor regardless: raw.githubusercontent.com caches files for
+# 5 minutes, so no schedule can detect a change faster than that.
+#
+# ⚠ Whether 15 minutes actually helps depends on how often FPL-Core-Insights
+# publishes. Its refresh was believed to be twice daily; that has never been
+# measured properly. If it really is twice a day, most of these runs find nothing
+# new — harmless, but the win is smaller than it looks. Measure before assuming.
 on:
   schedule:
-    - cron: '30 8 * * *'
-    - cron: '30 18 * * *'
+    - cron: '*/15 11-22 * * 6,0'        # Sat & Sun, 11:00-22:59 UTC
+    - cron: '*/15 18-22 * * 1,2,3,5'    # Mon, Tue, Wed, Fri evenings (midweek rounds)
+    - cron: '25 2,8,14,20 * * *'        # baseline, four times a day
   workflow_dispatch:
     inputs:
       gw:
@@ -15,6 +40,11 @@ on:
         default: ''
       full_resync:
         description: 'Re-sync every gameweek of the season, not just the recent ones'
+        type: boolean
+        required: false
+        default: false
+      skip_pricing:
+        description: 'Sync points but do not touch prices'
         type: boolean
         required: false
         default: false
@@ -56,3 +86,24 @@ jobs:
           else
             python3 sync_gameweek.py --push --latest 3
           fi
+
+      # Runs AFTER the points sync, and only if it succeeded — pricing reads
+      # gw_player_stats, so pricing on a failed sync would price off stale scores.
+      #
+      # Safe to run on every single one of these frequent runs: the job replays
+      # every price from opening_price rather than nudging the current one, so
+      # running it a hundred times a day produces exactly the same market as
+      # running it once. It also declines to price a gameweek that is still being
+      # played, so a Saturday-afternoon run writes breakevens and nothing else.
+      #
+      # No continue-on-error: if pricing breaks, the run SHOULD go red. The one
+      # thing this project cannot afford is another permanently-red workflow
+      # teaching everyone to ignore red.
+      - name: Move prices
+        if: ${{ github.event.inputs.skip_pricing != 'true' }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          set -euo pipefail
+          python3 price_gameweek.py --push
